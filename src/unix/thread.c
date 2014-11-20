@@ -31,8 +31,58 @@
 #undef NANOSEC
 #define NANOSEC ((uint64_t) 1e9)
 
+
+struct thread_ctx {
+  void (*entry)(void* arg);
+  void* arg;
+};
+
+
+static void* uv__thread_start(void *arg)
+{
+  struct thread_ctx *ctx_p;
+  struct thread_ctx ctx;
+
+  ctx_p = arg;
+  ctx = *ctx_p;
+  free(ctx_p);
+  ctx.entry(ctx.arg);
+
+  return 0;
+}
+
+
+int uv_thread_create(uv_thread_t *tid, void (*entry)(void *arg), void *arg) {
+  struct thread_ctx* ctx;
+  int err;
+
+  ctx = malloc(sizeof(*ctx));
+  if (ctx == NULL)
+    return UV_ENOMEM;
+
+  ctx->entry = entry;
+  ctx->arg = arg;
+
+  err = pthread_create(tid, NULL, uv__thread_start, ctx);
+
+  if (err)
+    free(ctx);
+
+  return err ? -1 : 0;
+}
+
+
+uv_thread_t uv_thread_self(void) {
+  return pthread_self();
+}
+
 int uv_thread_join(uv_thread_t *tid) {
   return -pthread_join(*tid, NULL);
+}
+
+
+int uv_thread_equal(const uv_thread_t* t1, const uv_thread_t* t2) {
+  return pthread_equal(*t1, *t2);
 }
 
 
@@ -399,7 +449,9 @@ void uv_barrier_destroy(uv_barrier_t* barrier) {
 }
 
 
-void uv_barrier_wait(uv_barrier_t* barrier) {
+int uv_barrier_wait(uv_barrier_t* barrier) {
+  int serial_thread;
+
   uv_mutex_lock(&barrier->mutex);
   if (++barrier->count == barrier->n) {
     uv_sem_wait(&barrier->turnstile2);
@@ -411,7 +463,8 @@ void uv_barrier_wait(uv_barrier_t* barrier) {
   uv_sem_post(&barrier->turnstile1);
 
   uv_mutex_lock(&barrier->mutex);
-  if (--barrier->count == 0) {
+  serial_thread = (--barrier->count == 0);
+  if (serial_thread) {
     uv_sem_wait(&barrier->turnstile1);
     uv_sem_post(&barrier->turnstile2);
   }
@@ -419,6 +472,7 @@ void uv_barrier_wait(uv_barrier_t* barrier) {
 
   uv_sem_wait(&barrier->turnstile2);
   uv_sem_post(&barrier->turnstile2);
+  return serial_thread;
 }
 
 #else /* !(defined(__APPLE__) && defined(__MACH__)) */
@@ -434,10 +488,11 @@ void uv_barrier_destroy(uv_barrier_t* barrier) {
 }
 
 
-void uv_barrier_wait(uv_barrier_t* barrier) {
+int uv_barrier_wait(uv_barrier_t* barrier) {
   int r = pthread_barrier_wait(barrier);
   if (r && r != PTHREAD_BARRIER_SERIAL_THREAD)
     abort();
+  return r == PTHREAD_BARRIER_SERIAL_THREAD;
 }
 
 #endif /* defined(__APPLE__) && defined(__MACH__) */

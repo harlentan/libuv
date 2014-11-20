@@ -31,19 +31,22 @@
 
 #ifdef _MSC_VER
 # define INLINE __inline
+# define UV_THREAD_LOCAL __declspec( thread )
 #else
 # define INLINE inline
+# define UV_THREAD_LOCAL __thread
 #endif
 
 
 #ifdef _DEBUG
-extern __declspec( thread ) int uv__crt_assert_enabled;
+
+extern UV_THREAD_LOCAL int uv__crt_assert_enabled;
 
 #define UV_BEGIN_DISABLE_CRT_ASSERT()                           \
   {                                                             \
     int uv__saved_crt_assert_enabled = uv__crt_assert_enabled;  \
     uv__crt_assert_enabled = FALSE;
-  
+
 
 #define UV_END_DISABLE_CRT_ASSERT()                             \
     uv__crt_assert_enabled = uv__saved_crt_assert_enabled;      \
@@ -62,7 +65,6 @@ extern __declspec( thread ) int uv__crt_assert_enabled;
 /* Used by all handles. */
 #define UV_HANDLE_CLOSED                        0x00000002
 #define UV_HANDLE_ENDGAME_QUEUED                0x00000004
-#define UV_HANDLE_ACTIVE                        0x00000010
 
 /* uv-common.h: #define UV__HANDLE_CLOSING      0x00000001 */
 /* uv-common.h: #define UV__HANDLE_ACTIVE       0x00000040 */
@@ -72,7 +74,6 @@ extern __declspec( thread ) int uv__crt_assert_enabled;
 /* Used by streams and UDP handles. */
 #define UV_HANDLE_READING                       0x00000100
 #define UV_HANDLE_BOUND                         0x00000200
-#define UV_HANDLE_BIND_ERROR                    0x00000400
 #define UV_HANDLE_LISTENING                     0x00000800
 #define UV_HANDLE_CONNECTION                    0x00001000
 #define UV_HANDLE_CONNECTED                     0x00002000
@@ -84,8 +85,10 @@ extern __declspec( thread ) int uv__crt_assert_enabled;
 #define UV_HANDLE_EMULATE_IOCP                  0x00100000
 #define UV_HANDLE_BLOCKING_WRITES               0x00200000
 
-/* Only used by uv_tcp_t handles. */
+/* Used by uv_tcp_t and uv_udp_t handles */
 #define UV_HANDLE_IPV6                          0x01000000
+
+/* Only used by uv_tcp_t handles. */
 #define UV_HANDLE_TCP_NODELAY                   0x02000000
 #define UV_HANDLE_TCP_KEEPALIVE                 0x04000000
 #define UV_HANDLE_TCP_SINGLE_ACCEPT             0x08000000
@@ -96,6 +99,7 @@ extern __declspec( thread ) int uv__crt_assert_enabled;
 /* Only used by uv_pipe_t handles. */
 #define UV_HANDLE_NON_OVERLAPPED_PIPE           0x01000000
 #define UV_HANDLE_PIPESERVER                    0x02000000
+#define UV_HANDLE_PIPE_READ_CANCELABLE          0x04000000
 
 /* Only used by uv_tty_t handles. */
 #define UV_HANDLE_TTY_READABLE                  0x01000000
@@ -120,6 +124,12 @@ extern __declspec( thread ) int uv__crt_assert_enabled;
 /*
  * TCP
  */
+
+typedef struct {
+  WSAPROTOCOL_INFOW socket_info;
+  int delayed_error;
+} uv__ipc_socket_info_ex;
+
 int uv_tcp_listen(uv_tcp_t* handle, int backlog, uv_connection_cb cb);
 int uv_tcp_accept(uv_tcp_t* server, uv_tcp_t* client);
 int uv_tcp_read_start(uv_tcp_t* handle, uv_alloc_cb alloc_cb,
@@ -138,7 +148,7 @@ void uv_process_tcp_connect_req(uv_loop_t* loop, uv_tcp_t* handle,
 void uv_tcp_close(uv_loop_t* loop, uv_tcp_t* tcp);
 void uv_tcp_endgame(uv_loop_t* loop, uv_tcp_t* handle);
 
-int uv_tcp_import(uv_tcp_t* tcp, WSAPROTOCOL_INFOW* socket_protocol_info,
+int uv_tcp_import(uv_tcp_t* tcp, uv__ipc_socket_info_ex* socket_info_ex,
     int tcp_connection);
 
 int uv_tcp_duplicate_socket(uv_tcp_t* handle, int pid,
@@ -171,6 +181,9 @@ int uv_pipe_write(uv_loop_t* loop, uv_write_t* req, uv_pipe_t* handle,
 int uv_pipe_write2(uv_loop_t* loop, uv_write_t* req, uv_pipe_t* handle,
     const uv_buf_t bufs[], unsigned int nbufs, uv_stream_t* send_handle,
     uv_write_cb cb);
+void uv__pipe_pause_read(uv_pipe_t* handle);
+void uv__pipe_unpause_read(uv_pipe_t* handle);
+void uv__pipe_stop_read(uv_pipe_t* handle);
 
 void uv_process_pipe_read_req(uv_loop_t* loop, uv_pipe_t* handle,
     uv_req_t* req);
@@ -229,7 +242,7 @@ void uv_poll_endgame(uv_loop_t* loop, uv_poll_t* handle);
  */
 void uv_timer_endgame(uv_loop_t* loop, uv_timer_t* handle);
 
-DWORD uv_get_poll_timeout(uv_loop_t* loop);
+DWORD uv__next_timeout(const uv_loop_t* loop);
 void uv__time_forward(uv_loop_t* loop, uint64_t msecs);
 void uv_process_timers(uv_loop_t* loop);
 
@@ -284,22 +297,9 @@ int uv_translate_sys_error(int sys_errno);
 
 
 /*
- * Getaddrinfo
- */
-void uv_process_getaddrinfo_req(uv_loop_t* loop, uv_getaddrinfo_t* req);
-
-
-/*
  * FS
  */
 void uv_fs_init();
-void uv_process_fs_req(uv_loop_t* loop, uv_fs_t* req);
-
-
-/*
- * Threadpool
- */
-void uv_process_work_req(uv_loop_t* loop, uv_work_t* req);
 
 
 /*
@@ -322,6 +322,7 @@ void uv__fs_poll_endgame(uv_loop_t* loop, uv_fs_poll_t* handle);
  */
 void uv__util_init();
 
+uint64_t uv__hrtime(double scale);
 int uv_parent_pid();
 __declspec(noreturn) void uv_fatal_error(const int errorno, const char* syscall);
 

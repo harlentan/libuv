@@ -42,6 +42,12 @@
 # include <port.h>
 #endif /* __sun */
 
+#if defined(_AIX)
+#define reqevents events
+#define rtnevents revents
+#include <sys/poll.h>
+#endif /* _AIX */
+
 #if defined(__APPLE__) && !TARGET_OS_IPHONE
 # include <CoreServices/CoreServices.h>
 #endif
@@ -89,7 +95,7 @@
 # define UV__POLLHUP  UV__EPOLLHUP
 #endif
 
-#if defined(__sun)
+#if defined(__sun) || defined(_AIX)
 # define UV__POLLIN   POLLIN
 # define UV__POLLOUT  POLLOUT
 # define UV__POLLERR  POLLERR
@@ -136,7 +142,8 @@ enum {
   UV_STREAM_READ_EOF      = 0x200,  /* read(2) read EOF. */
   UV_TCP_NODELAY          = 0x400,  /* Disable Nagle. */
   UV_TCP_KEEPALIVE        = 0x800,  /* Turn on keep-alive. */
-  UV_TCP_SINGLE_ACCEPT    = 0x1000  /* Only accept() when idle. */
+  UV_TCP_SINGLE_ACCEPT    = 0x1000, /* Only accept() when idle. */
+  UV_HANDLE_IPV6          = 0x10000 /* Handle is bound to a IPv6 socket. */
 };
 
 typedef enum {
@@ -209,13 +216,6 @@ void uv__signal_close(uv_signal_t* handle);
 void uv__signal_global_once_init(void);
 void uv__signal_loop_cleanup(uv_loop_t* loop);
 
-/* thread pool */
-void uv__work_submit(uv_loop_t* loop,
-                     struct uv__work *w,
-                     void (*work)(struct uv__work *w),
-                     void (*done)(struct uv__work *w, int status));
-void uv__work_done(uv_async_t* handle);
-
 /* platform specific */
 uint64_t uv__hrtime(uv_clocktype_t type);
 int uv__kqueue_init(uv_loop_t* loop);
@@ -240,8 +240,8 @@ void uv__udp_finish_close(uv_udp_t* handle);
 uv_handle_type uv__handle_type(int fd);
 
 #if defined(__APPLE__)
-int uv___stream_fd(uv_stream_t* handle);
-#define uv__stream_fd(handle) (uv___stream_fd((uv_stream_t*) (handle)))
+int uv___stream_fd(const uv_stream_t* handle);
+#define uv__stream_fd(handle) (uv___stream_fd((const uv_stream_t*) (handle)))
 #else
 #define uv__stream_fd(handle) ((handle)->io_watcher.fd)
 #endif /* defined(__APPLE__) */
@@ -305,13 +305,5 @@ UV_UNUSED(static char* uv__basename_r(const char* path)) {
 
   return s + 1;
 }
-
-
-#ifdef HAVE_DTRACE
-#include "uv-dtrace.h"
-#else
-#define UV_TICK_START(arg0, arg1)
-#define UV_TICK_STOP(arg0, arg1)
-#endif
 
 #endif /* UV_UNIX_INTERNAL_H_ */

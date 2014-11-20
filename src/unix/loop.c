@@ -89,15 +89,16 @@ uv_loop_t* uv_loop_new(void) {
 
 void uv_loop_delete(uv_loop_t* loop) {
   uv_loop_t* default_loop;
+  int err;
   default_loop = default_loop_ptr;
-  assert(uv_loop_close(loop) == 0);
+  err = uv_loop_close(loop);
+  assert(err == 0);
   if (loop != default_loop)
     free(loop);
 }
 
 
 static int uv__loop_init(uv_loop_t* loop, int default_loop) {
-  unsigned int i;
   int err;
 
   uv__signal_global_once_init();
@@ -136,9 +137,7 @@ static int uv__loop_init(uv_loop_t* loop, int default_loop) {
   uv_signal_init(loop, &loop->child_watcher);
   uv__handle_unref(&loop->child_watcher);
   loop->child_watcher.flags |= UV__HANDLE_INTERNAL;
-
-  for (i = 0; i < ARRAY_SIZE(loop->process_handles); i++)
-    QUEUE_INIT(loop->process_handles + i);
+  QUEUE_INIT(&loop->process_handles);
 
   if (uv_rwlock_init(&loop->cloexec_lock))
     abort();

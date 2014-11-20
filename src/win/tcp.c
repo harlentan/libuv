@@ -156,6 +156,7 @@ int uv_tcp_init(uv_loop_t* loop, uv_tcp_t* handle) {
   handle->func_acceptex = NULL;
   handle->func_connectex = NULL;
   handle->processed_accepts = 0;
+  handle->delayed_error = 0;
 
   return 0;
 }
@@ -195,6 +196,7 @@ void uv_tcp_endgame(uv_loop_t* loop, uv_tcp_t* handle) {
 
     if (!(handle->flags & UV_HANDLE_TCP_SOCKET_CLOSED)) {
       closesocket(handle->socket);
+      handle->socket = INVALID_SOCKET;
       handle->flags |= UV_HANDLE_TCP_SOCKET_CLOSED;
     }
 
@@ -235,6 +237,17 @@ void uv_tcp_endgame(uv_loop_t* loop, uv_tcp_t* handle) {
 }
 
 
+/* Unlike on Unix, here we don't set SO_REUSEADDR, because it doesn't just
+ * allow binding to addresses that are in use by sockets in TIME_WAIT, it
+ * effectively allows 'stealing' a port which is in use by another application.
+ *
+ * SO_EXCLUSIVEADDRUSE is also not good here because it does cehck all sockets,
+ * regardless of state, so we'd get an error even if the port is in use by a
+ * socket in TIME_WAIT state.
+ *
+ * See issue #1360.
+ *
+ */
 static int uv_tcp_try_bind(uv_tcp_t* handle,
                            const struct sockaddr* addr,
                            unsigned int addrlen,
@@ -243,7 +256,13 @@ static int uv_tcp_try_bind(uv_tcp_t* handle,
   int r;
 
   if (handle->socket == INVALID_SOCKET) {
-    SOCKET sock = socket(addr->sa_family, SOCK_STREAM, 0);
+    SOCKET sock;
+
+    /* Cannot set IPv6-only mode on non-IPv6 socket. */
+    if ((flags & UV_TCP_IPV6ONLY) && addr->sa_family != AF_INET6)
+      return ERROR_INVALID_PARAMETER;
+
+    sock = socket(addr->sa_family, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
       return WSAGetLastError();
     }
@@ -285,8 +304,7 @@ static int uv_tcp_try_bind(uv_tcp_t* handle,
     err = WSAGetLastError();
     if (err == WSAEADDRINUSE) {
       /* Some errors are not to be reported until connect() or listen() */
-      handle->bind_error = err;
-      handle->flags |= UV_HANDLE_BIND_ERROR;
+      handle->delayed_error = err;
     } else {
       return err;
     }
@@ -511,8 +529,8 @@ int uv_tcp_listen(uv_tcp_t* handle, int backlog, uv_connection_cb cb) {
     return WSAEISCONN;
   }
 
-  if (handle->flags & UV_HANDLE_BIND_ERROR) {
-    return handle->bind_error;
+  if (handle->delayed_error) {
+    return handle->delayed_error;
   }
 
   if (!(handle->flags & UV_HANDLE_BOUND)) {
@@ -522,6 +540,8 @@ int uv_tcp_listen(uv_tcp_t* handle, int backlog, uv_connection_cb cb) {
                           0);
     if (err)
       return err;
+    if (handle->delayed_error)
+      return handle->delayed_error;
   }
 
   if (!handle->func_acceptex) {
@@ -693,8 +713,8 @@ static int uv_tcp_try_connect(uv_connect_t* req,
   DWORD bytes;
   int err;
 
-  if (handle->flags & UV_HANDLE_BIND_ERROR) {
-    return handle->bind_error;
+  if (handle->delayed_error) {
+    return handle->delayed_error;
   }
 
   if (!(handle->flags & UV_HANDLE_BOUND)) {
@@ -708,6 +728,8 @@ static int uv_tcp_try_connect(uv_connect_t* req,
     err = uv_tcp_try_bind(handle, bind_addr, addrlen, 0);
     if (err)
       return err;
+    if (handle->delayed_error)
+      return handle->delayed_error;
   }
 
   if (!handle->func_connectex) {
@@ -747,16 +769,17 @@ static int uv_tcp_try_connect(uv_connect_t* req,
 }
 
 
-int uv_tcp_getsockname(uv_tcp_t* handle, struct sockaddr* name,
-    int* namelen) {
+int uv_tcp_getsockname(const uv_tcp_t* handle,
+                       struct sockaddr* name,
+                       int* namelen) {
   int result;
 
   if (!(handle->flags & UV_HANDLE_BOUND)) {
     return UV_EINVAL;
   }
 
-  if (handle->flags & UV_HANDLE_BIND_ERROR) {
-    return uv_translate_sys_error(handle->bind_error);
+  if (handle->delayed_error) {
+    return uv_translate_sys_error(handle->delayed_error);
   }
 
   result = getsockname(handle->socket, name, namelen);
@@ -768,16 +791,17 @@ int uv_tcp_getsockname(uv_tcp_t* handle, struct sockaddr* name,
 }
 
 
-int uv_tcp_getpeername(uv_tcp_t* handle, struct sockaddr* name,
-    int* namelen) {
+int uv_tcp_getpeername(const uv_tcp_t* handle,
+                       struct sockaddr* name,
+                       int* namelen) {
   int result;
 
   if (!(handle->flags & UV_HANDLE_BOUND)) {
     return UV_EINVAL;
   }
 
-  if (handle->flags & UV_HANDLE_BIND_ERROR) {
-    return uv_translate_sys_error(handle->bind_error);
+  if (handle->delayed_error) {
+    return uv_translate_sys_error(handle->delayed_error);
   }
 
   result = getpeername(handle->socket, name, namelen);
@@ -802,7 +826,6 @@ int uv_tcp_write(uv_loop_t* loop,
   req->type = UV_WRITE;
   req->handle = (uv_stream_t*) handle;
   req->cb = cb;
-  memset(&req->overlapped, 0, sizeof(req->overlapped));
 
   /* Prepare the overlapped structure. */
   memset(&(req->overlapped), 0, sizeof(req->overlapped));
@@ -832,7 +855,7 @@ int uv_tcp_write(uv_loop_t* loop,
     uv_insert_pending_req(loop, (uv_req_t*) req);
   } else if (UV_SUCCEEDED_WITH_IOCP(result == 0)) {
     /* Request queued by the kernel. */
-    req->queued_bytes = uv_count_bufs(bufs, nbufs);
+    req->queued_bytes = uv__count_bufs(bufs, nbufs);
     handle->reqs_pending++;
     handle->write_reqs_pending++;
     REGISTER_HANDLE_REQ(loop, handle, req);
@@ -1002,8 +1025,12 @@ void uv_process_tcp_write_req(uv_loop_t* loop, uv_tcp_t* handle,
   }
 
   if (req->cb) {
-    err = GET_REQ_SOCK_ERROR(req);
-    req->cb(req, uv_translate_sys_error(err));
+    err = uv_translate_sys_error(GET_REQ_SOCK_ERROR(req));
+    if (err == UV_ECONNABORTED) {
+      /* use UV_ECANCELED for consistency with Unix */
+      err = UV_ECANCELED;
+    }
+    req->cb(req, err);
   }
 
   handle->write_reqs_pending--;
@@ -1095,14 +1122,13 @@ void uv_process_tcp_connect_req(uv_loop_t* loop, uv_tcp_t* handle,
 }
 
 
-int uv_tcp_import(uv_tcp_t* tcp, WSAPROTOCOL_INFOW* socket_protocol_info,
+int uv_tcp_import(uv_tcp_t* tcp, uv__ipc_socket_info_ex* socket_info_ex,
     int tcp_connection) {
   int err;
-
   SOCKET socket = WSASocketW(FROM_PROTOCOL_INFO,
                              FROM_PROTOCOL_INFO,
                              FROM_PROTOCOL_INFO,
-                             socket_protocol_info,
+                             &socket_info_ex->socket_info,
                              0,
                              WSA_FLAG_OVERLAPPED);
 
@@ -1119,7 +1145,7 @@ int uv_tcp_import(uv_tcp_t* tcp, WSAPROTOCOL_INFOW* socket_protocol_info,
   err = uv_tcp_set_socket(tcp->loop,
                           tcp,
                           socket,
-                          socket_protocol_info->iAddressFamily,
+                          socket_info_ex->socket_info.iAddressFamily,
                           1);
   if (err) {
     closesocket(socket);
@@ -1133,6 +1159,8 @@ int uv_tcp_import(uv_tcp_t* tcp, WSAPROTOCOL_INFOW* socket_protocol_info,
 
   tcp->flags |= UV_HANDLE_BOUND;
   tcp->flags |= UV_HANDLE_SHARED_TCP_SOCKET;
+
+  tcp->delayed_error = socket_info_ex->delayed_error;
 
   tcp->loop->active_tcp_streams++;
   return 0;
@@ -1194,13 +1222,10 @@ int uv_tcp_duplicate_socket(uv_tcp_t* handle, int pid,
         return ERROR_INVALID_PARAMETER;
       }
 
-      /* Report any deferred bind errors now. */
-      if (handle->flags & UV_HANDLE_BIND_ERROR) {
-        return handle->bind_error;
-      }
-
-      if (listen(handle->socket, SOMAXCONN) == SOCKET_ERROR) {
-        return WSAGetLastError();
+      if (!(handle->delayed_error)) {
+        if (listen(handle->socket, SOMAXCONN) == SOCKET_ERROR) {
+          handle->delayed_error = WSAGetLastError();
+        }
       }
     }
   }
@@ -1344,6 +1369,7 @@ void uv_tcp_close(uv_loop_t* loop, uv_tcp_t* tcp) {
 
   if (close_socket) {
     closesocket(tcp->socket);
+    tcp->socket = INVALID_SOCKET;
     tcp->flags |= UV_HANDLE_TCP_SOCKET_CLOSED;
   }
 
